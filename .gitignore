@@ -1,0 +1,5 @@
+/browser-history-to-sqlite
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
