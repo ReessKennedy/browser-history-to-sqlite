@@ -1,14 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -24,23 +24,70 @@ type visit struct {
 }
 
 func main() {
-	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [-db history.sqlite] BrowserHistory.json\n", filepath.Base(os.Args[0]))
-		flag.PrintDefaults()
-	}
-	dbPath := flag.String("db", "history.sqlite", "SQLite database path")
-	flag.Parse()
-	if flag.NArg() != 1 {
-		flag.Usage()
-		os.Exit(2)
-	}
-	if err := run(flag.Arg(0), *dbPath, os.Stderr); err != nil {
+	if err := interactive(os.Stdin, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "Import failed:", err)
 		os.Exit(1)
 	}
 }
 
-func run(inputPath, dbPath string, output io.Writer) error {
+func interactive(input io.Reader, output io.Writer) error {
+	reader := bufio.NewReader(input)
+	dbPath, err := promptPath(reader, output, "SQLite database path (create or update)")
+	if err != nil {
+		return err
+	}
+	browser, err := promptBrowser(reader, output)
+	if err != nil {
+		return err
+	}
+	inputPath, err := promptPath(reader, output, "Browser history JSON file path")
+	if err != nil {
+		return err
+	}
+	return run(inputPath, dbPath, browser, output)
+}
+
+func promptBrowser(reader *bufio.Reader, output io.Writer) (string, error) {
+	fmt.Fprintln(output, "Browser export type:\n  1. Chrome")
+	for {
+		fmt.Fprint(output, "Choose a browser (1): ")
+		line, err := reader.ReadString('\n')
+		if err != nil && err != io.EOF {
+			return "", fmt.Errorf("read browser: %w", err)
+		}
+		if strings.TrimSpace(line) == "1" {
+			return "Chrome", nil
+		}
+		if err == io.EOF {
+			return "", errors.New("input ended before a browser was selected")
+		}
+		fmt.Fprintln(output, "Please enter 1 for Chrome.")
+	}
+}
+
+func promptPath(reader *bufio.Reader, output io.Writer, label string) (string, error) {
+	for {
+		fmt.Fprintf(output, "%s: ", label)
+		line, err := reader.ReadString('\n')
+		if err != nil && err != io.EOF {
+			return "", fmt.Errorf("read path: %w", err)
+		}
+		path := strings.TrimSpace(line)
+		// Accept paths pasted with matching quotes, as well as paths containing spaces.
+		if len(path) >= 2 && ((path[0] == '\'' && path[len(path)-1] == '\'') || (path[0] == '"' && path[len(path)-1] == '"')) {
+			path = path[1 : len(path)-1]
+		}
+		if path != "" {
+			return path, nil
+		}
+		if err == io.EOF {
+			return "", errors.New("input ended before a path was provided")
+		}
+		fmt.Fprintln(output, "Please enter a path.")
+	}
+}
+
+func run(inputPath, dbPath, browser string, output io.Writer) error {
 	input, err := os.Open(inputPath)
 	if err != nil {
 		return fmt.Errorf("open input: %w", err)
@@ -66,8 +113,8 @@ func run(inputPath, dbPath string, output io.Writer) error {
 	}
 	defer tx.Rollback()
 	_, err = tx.Exec(`CREATE TABLE IF NOT EXISTS browser_history (
- id INTEGER PRIMARY KEY, favicon_url TEXT, page_transition TEXT, title TEXT,
- url TEXT NOT NULL, client_id TEXT, time_usec INTEGER NOT NULL,
+ id INTEGER PRIMARY KEY, page_transition TEXT, title TEXT, url TEXT NOT NULL,
+ client_id TEXT, browser TEXT NOT NULL, time_usec INTEGER NOT NULL, favicon_url TEXT,
  UNIQUE(time_usec, url)
  );
  CREATE TABLE IF NOT EXISTS log (
@@ -77,8 +124,8 @@ func run(inputPath, dbPath string, output io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("create tables: %w", err)
 	}
-	stmt, err := tx.Prepare(`INSERT INTO browser_history (favicon_url, page_transition, title, url, client_id, time_usec)
- VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(time_usec, url) DO NOTHING`)
+	stmt, err := tx.Prepare(`INSERT INTO browser_history (favicon_url, page_transition, title, url, client_id, browser, time_usec)
+ VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(time_usec, url) DO NOTHING`)
 	if err != nil {
 		return fmt.Errorf("prepare insert: %w", err)
 	}
@@ -86,7 +133,7 @@ func run(inputPath, dbPath string, output io.Writer) error {
 	fmt.Fprintf(output, "Importing %s into %s...\n", inputPath, dbPath)
 	added, duplicates := 0, 0
 	err = readHistory(input, func(v visit) error {
-		result, err := stmt.Exec(v.FaviconURL, v.PageTransition, v.Title, v.URL, v.ClientID, *v.TimeUsec)
+		result, err := stmt.Exec(v.FaviconURL, v.PageTransition, v.Title, v.URL, v.ClientID, browser, *v.TimeUsec)
 		if err != nil {
 			return err
 		}
